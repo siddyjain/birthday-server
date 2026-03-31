@@ -1,94 +1,68 @@
 /**
  * Birthday Video Server
  * - Accepts video uploads from guests
- * - Saves them to Google Drive
+ * - Saves them to Cloudinary
  * - Returns the list of all uploaded videos
  * - Deploy on Railway
  */
 
-const express = require('express');
-const multer  = require('multer');
-const cors    = require('cors');
-const { google } = require('googleapis');
-const fs   = require('fs');
-const path = require('path');
+const express    = require('express');
+const multer     = require('multer');
+const cors       = require('cors');
+const cloudinary = require('cloudinary').v2;
+const fs         = require('fs');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── CORS: allow your GitHub Pages domain (or * for open access) ──
+// ── CORS ──
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ── Multer: store uploads temporarily on disk ──
+// ── Cloudinary config (reads from environment variables) ──
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+const FOLDER = 'birthday-wishes'; // folder name inside Cloudinary
+
+// ── Multer: temp storage ──
 const upload = multer({
   dest: '/tmp/uploads/',
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500 MB max per file
+  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB max
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith('video/')) cb(null, true);
     else cb(new Error('Only video files are allowed'), false);
   }
 });
 
-// ── Google Drive Auth ──
-// Reads credentials from environment variable GOOGLE_SERVICE_ACCOUNT_JSON
-function getDriveClient() {
-  const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-  const auth = new google.auth.GoogleAuth({
-    credentials: creds,
-    scopes: ['https://www.googleapis.com/auth/drive'],
-  });
-  return google.drive({ version: 'v3', auth });
-}
-
-const FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
-
-// ── Upload endpoint ──
-// POST /upload  (multipart: field "video" + optional field "caption")
+// ── POST /upload ──
 app.post('/upload', upload.single('video'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No video file received' });
 
-  const caption  = req.body.caption || '';
-  const origName = req.body.originalName || req.file.originalname || 'birthday-wish.mp4';
+  const caption = req.body.caption || '';
 
   try {
-    const drive = getDriveClient();
-
-    // 1. Upload file to Google Drive
-    const driveRes = await drive.files.create({
-      requestBody: {
-        name: origName,
-        parents: [FOLDER_ID],
-        description: caption,           // store caption in Drive description
-        appProperties: { caption },     // also in appProperties for easy retrieval
-      },
-      media: {
-        mimeType: req.file.mimetype,
-        body: fs.createReadStream(req.file.path),
-      },
-      fields: 'id, name, description, appProperties, webContentLink, webViewLink',
+    // Upload to Cloudinary
+    const result = await cloudinary.uploader.upload(req.file.path, {
+      resource_type: 'video',
+      folder:        FOLDER,
+      context:       `caption=${caption}`,
+      eager_async:   true,
     });
 
-    // 2. Make the file publicly readable
-    await drive.permissions.create({
-      fileId: driveRes.data.id,
-      requestBody: { role: 'reader', type: 'anyone' },
-    });
-
-    // 3. Clean up temp file
+    // Clean up temp file
     fs.unlink(req.file.path, () => {});
-
-    // 4. Build a streamable URL
-    //    Google Drive direct stream URL format:
-    const streamUrl = `https://drive.google.com/uc?export=download&id=${driveRes.data.id}`;
 
     res.json({
       success: true,
       video: {
-        id:      driveRes.data.id,
-        name:    driveRes.data.name,
+        id:      result.public_id,
+        name:    result.original_filename,
         caption: caption,
-        url:     streamUrl,
+        url:     result.secure_url,
       }
     });
 
@@ -99,25 +73,22 @@ app.post('/upload', upload.single('video'), async (req, res) => {
   }
 });
 
-// ── List videos endpoint ──
-// GET /videos  →  returns all videos in the Drive folder
+// ── GET /videos ──
 app.get('/videos', async (req, res) => {
   try {
-    const drive = getDriveClient();
+    const result = await cloudinary.search
+      .expression(`folder:${FOLDER} AND resource_type:video`)
+      .sort_by('created_at', 'asc')
+      .with_field('context')
+      .max_results(200)
+      .execute();
 
-    const listRes = await drive.files.list({
-      q: `'${FOLDER_ID}' in parents and mimeType contains 'video/' and trashed = false`,
-      fields: 'files(id, name, description, appProperties, createdTime)',
-      orderBy: 'createdTime asc',
-      pageSize: 200,
-    });
-
-    const videos = listRes.data.files.map(f => ({
-      id:      f.id,
-      name:    f.name,
-      caption: (f.appProperties && f.appProperties.caption) || f.description || '',
-      url:     `https://drive.google.com/uc?export=download&id=${f.id}`,
-      createdTime: f.createdTime,
+    const videos = result.resources.map(r => ({
+      id:      r.public_id,
+      name:    r.filename,
+      caption: (r.context && r.context.caption) || '',
+      url:     r.secure_url,
+      createdTime: r.created_at,
     }));
 
     res.json({ videos });
